@@ -1,5 +1,13 @@
 # Proof Decay
 
+![Proof Decay demo](media/demo.gif)
+
+*Tests and tsc pass, so the board reads `✓ tests fresh · ✓ types fresh`. One edit later both go `⚠ stale (1 edit)`, and a commit claiming "All tests pass" is refused by Oathkeeper. [MP4](media/demo.mp4)*
+
+| Fresh | Stale | Refused |
+|---|---|---|
+| ![fresh](media/01-fresh.png) | ![stale](media/02-stale.png) | ![refused](media/03-refused.png) |
+
 A Claude Code mod that tracks which verification results are still true.
 
 "Tests passed" stops meaning anything once the code changes. Proof Decay records every test, typecheck, lint and build run the agent makes, then marks the result **stale** as soon as a later edit touches what it covered.
