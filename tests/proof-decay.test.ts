@@ -152,6 +152,17 @@ test('a commit claiming stale tests pass is refused', async ($, on) => {
   expect(commit.deny).toMatch(/claims tests pass/)
 })
 
+test('a refused commit leaves the proof stale, never failed', async ($, on) => {
+  world(on)
+  on('tool.call', (_$, e) => (e.tool === 'Edit' ? edited() : ok()))
+  await $.tool.call({ tool: 'Bash', command: 'npm test' })
+  await $.tool.call({ tool: 'Edit', file_path: '/repo/src/a.ts', old_string: 'a', new_string: 'b' })
+  await $.tool.call({ tool: 'Bash', command: 'git commit -am "All tests pass."' })
+  const text = await proofsText($)
+  expect(text).toMatch(/tests stale \(1 edit\)/)
+  expect(text).not.toMatch(/failed/)
+})
+
 test('a claim chained with other commands is refused', async ($, on) => {
   world(on)
   on('tool.call', () => ok())
