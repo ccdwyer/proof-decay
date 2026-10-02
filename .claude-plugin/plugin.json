@@ -1,0 +1,11 @@
+{
+  "name": "proof-decay",
+  "version": "0.1.0",
+  "description": "Tracks which test, typecheck, lint and build results are still true after later edits, and stops commit messages that claim checks which are stale",
+  "types": "./types/index.d.ts",
+  "author": {
+    "name": "Chris Dwyer",
+    "url": "https://github.com/ccdwyer"
+  },
+  "repository": "https://github.com/ccdwyer/proof-decay"
+}
