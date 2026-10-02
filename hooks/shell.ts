@@ -1,22 +1,61 @@
 import type { ProofKind } from '../types'
 
-// A simple command and the operator that follows it ('' after the last).
-export type Segment = { words: string[]; sep: string }
+// A simple command and the operator that follows it ('' after the last). ctx is 0
+// for the call's own shell and n for the n-th `bash -c` body, whose cd ends with it.
+// docs: indexes into Parsed.heredocs of the heredocs this command opened.
+export type Segment = { words: string[]; sep: string; ctx: number; docs: number[] }
 // complex: substitutions, backticks, subshells or heredocs whose effect a parse cannot see.
-export type Parsed = { segments: Segment[]; complex: boolean; heredocs: string[] }
+// grouped: subshells, brace groups or nested shells, whose exit status is not one segment's.
+// liveHeredocs: bodies whose delimiter was unquoted, so $ in them expands.
+// parents: each nested shell's (or subshell's) context and the context that started it.
+// starts: the directory a nested shell starts in when a wrapper moves it (`env -C dir bash -c`).
+// bodies: each nested shell's decoded text and context, for what runs inside it.
+export type Parsed = {
+  segments: Segment[]
+  complex: boolean
+  grouped: boolean
+  heredocs: string[]
+  liveHeredocs: string[]
+  parents: Record<number, number>
+  starts: Record<number, string>
+  bodies: { text: string; ctx: number }[]
+}
+
+// $ and ` that the shell will not expand (single quotes, a backslash) are carried
+// in words as these private-use characters, so a reader can tell them from live ones.
+const LITERAL_DOLLAR = '\uE000'
+const LITERAL_TICK = '\uE001'
+// The word as the program receives it.
+const DOC = /\uE002(\d+)\uE002/g
+export const literal = (word: string) => word.replace(/\uE000/g, '$').replace(/\uE001/g, '`').replace(DOC, '')
+const shield = (text: string) => text.replace(/\$/g, LITERAL_DOLLAR).replace(/`/g, LITERAL_TICK)
 
 const HEREDOC = /<<-?[ \t]*(['"]?)([A-Za-z_][A-Za-z0-9_]*)\1[^\n]*\n([\s\S]*?)\n[ \t]*\2(?=\s|\)|$)/g
 
 // Splits a command into simple commands, honouring quotes and comments: operators
 // inside quotes, $(...), backticks or a # comment are text, never separators.
 export function parse(command: string): Parsed {
+  return parseIn(command, { next: 0 }, 0)
+}
+
+function parseIn(command: string, ids: { next: number }, own: number): Parsed {
+  const parents: Record<number, number> = {}
+  const starts: Record<number, string> = {}
+  const bodies: { text: string; ctx: number }[] = []
+  // Contexts open at this point: a subshell `( … )` is a shell of its own; braces are not.
+  const stack = [own]
+  const ctxNow = () => stack[stack.length - 1]!
   const heredocs: string[] = []
+  const liveHeredocs: string[] = []
   let complex = false
+  let grouped = false
   // Heredoc bodies are data; keep them aside and drop them from what is split.
-  const text = command.replace(HEREDOC, (_m, _q, tag: string, body: string) => {
+  // Each body is marked in place, so the command that opened it can find it.
+  const text = command.replace(HEREDOC, (_m, quote: string, tag: string, body: string) => {
     heredocs.push(body)
+    if (quote === '') liveHeredocs.push(body)
     complex = true
-    return `<<${tag}`
+    return `<<${tag}\uE002${heredocs.length - 1}\uE002`
   })
 
   const segments: Segment[] = []
@@ -30,7 +69,7 @@ export function parse(command: string): Parsed {
   }
   const endSegment = (sep: string) => {
     endWord()
-    if (words.length > 0) segments.push({ words, sep })
+    if (words.length > 0) segments.push({ words, sep, ctx: ctxNow(), docs: [...words.join(' ').matchAll(DOC)].map(m => Number(m[1])) })
     else if (segments.length > 0 && sep !== '') segments[segments.length - 1]!.sep = sep
     words = []
   }
@@ -39,7 +78,7 @@ export function parse(command: string): Parsed {
     const c = text[i]!
     const two = text.slice(i, i + 2)
     if (c === '\\' && i + 1 < text.length) {
-      if (text[i + 1] !== '\n') word += text[i + 1]
+      if (text[i + 1] !== '\n') word += shield(text[i + 1]!)
       hasWord = hasWord || text[i + 1] !== '\n'
       i += 1
     } else if (c === '#' && !hasWord) {
@@ -49,14 +88,14 @@ export function parse(command: string): Parsed {
     } else if (c === "'") {
       const end = text.indexOf("'", i + 1)
       const stop = end === -1 ? text.length : end
-      word += text.slice(i + 1, stop)
+      word += shield(text.slice(i + 1, stop))
       hasWord = true
       i = stop
     } else if (c === '"') {
       let j = i + 1
       while (j < text.length && text[j] !== '"') {
         if (text[j] === '\\' && j + 1 < text.length) {
-          word += text[j + 1]
+          word += shield(text[j + 1]!)
           j += 2
           continue
         }
@@ -95,8 +134,23 @@ export function parse(command: string): Parsed {
       } else {
         endSegment(c === '\n' ? ';' : c)
       }
-    } else if ((c === '(' || c === ')' || c === '{' || c === '}') && !hasWord) {
+    } else if (c === '(' || c === ')') {
+      // A subshell: its cd ends at the `)`, and its exit status is not one command's.
       complex = true
+      grouped = true
+      if (c === '(') {
+        endWord()
+        if (words.length > 0) endSegment('')
+        const sub = (ids.next += 1)
+        parents[sub] = ctxNow()
+        stack.push(sub)
+      } else {
+        endSegment('')
+        if (stack.length > 1) stack.pop()
+      }
+    } else if ((c === '{' || c === '}') && !hasWord) {
+      complex = true
+      grouped = true
     } else if (c === ' ' || c === '\t') {
       endWord()
     } else {
@@ -116,19 +170,46 @@ export function parse(command: string): Parsed {
       flat.push(seg)
       continue
     }
-    const p = parse(inner)
+    // The body runs in a shell of its own: its cd ends with it. Its && / ; chain
+    // has the same exit status flattened in place, so only grouping inside it is.
+    const ctx = (ids.next += 1)
+    parents[ctx] = seg.ctx
+    const body = literal(inner)
+    const p = parseIn(body, ids, ctx)
+    const offset = heredocs.length
     heredocs.push(...p.heredocs)
-    if (p.complex || p.segments.length > 1) complex = true
-    p.segments.forEach((s, i) => flat.push(i === p.segments.length - 1 ? { ...s, sep: seg.sep } : s))
+    liveHeredocs.push(...p.liveHeredocs)
+    Object.assign(parents, p.parents)
+    Object.assign(starts, p.starts)
+    bodies.push({ text: body, ctx }, ...p.bodies)
+    if (p.complex) complex = true
+    // A group inside the child does not hide the parent chain's exit status: the
+    // child's own && / ; chain is flattened in place and judged by its separators.
+    // `env -C dir bash -c '…'` starts the child shell in dir.
+    const moved = chdirOf(seg.words)
+    if (moved !== null) starts[ctx] = moved
+    p.segments.forEach((s, i) =>
+      flat.push({ ...s, docs: s.docs.map(d => d + offset), sep: i === p.segments.length - 1 ? seg.sep : s.sep }),
+    )
   }
-  return { segments: flat, complex, heredocs }
+  return { segments: flat, complex, grouped, heredocs, liveHeredocs, parents, starts, bodies }
 }
 
 // The commands inside $(...) and backticks: they run too.
 export function substitutions(command: string): string[] {
   const found: string[] = []
+  let doubled = false
   for (let i = 0; i < command.length; i += 1) {
-    if (command.slice(i, i + 2) === '$(') {
+    if (command[i] === '\\') {
+      i += 1
+    } else if (command[i] === '"') {
+      doubled = !doubled
+    } else if (command[i] === "'" && !doubled) {
+      // Single quotes outside double quotes: nothing inside runs.
+      const end = command.indexOf("'", i + 1)
+      if (end === -1) break
+      i = end
+    } else if (command.slice(i, i + 2) === '$(') {
       let depth = 0
       let j = i + 1
       for (; j < command.length; j += 1) {
@@ -188,6 +269,39 @@ export function unwrap(argv: string[]): string[] {
 }
 
 const base = (word: string) => word.replace(/^.*\//, '')
+
+// The directory a wrapper runs the command in (`env -C dir`, `env --chdir=dir`), if any.
+export function chdirOf(words: string[]): string | null {
+  const argv = stripRedirects(words)
+  let i = 0
+  while (i < argv.length) {
+    const w = argv[i]!
+    if (/^[A-Za-z_][A-Za-z0-9_]*=/.test(w)) {
+      i += 1
+      continue
+    }
+    const tool = base(w)
+    if (tool === 'env') {
+      i += 1
+      while (i < argv.length) {
+        const f = argv[i]!
+        if (f === '-C' || f === '--chdir') return argv[i + 1] ?? null
+        if (f.startsWith('--chdir=')) return f.slice(8)
+        if (/^-C./.test(f)) return f.slice(2)
+        if (f === '-u' || f === '--unset' || f === '-S' || f === '--split-string') i += 2
+        else if (f.startsWith('-') || /^[A-Za-z_][A-Za-z0-9_]*=/.test(f)) i += 1
+        else break
+      }
+      continue
+    }
+    const takesValue = WRAPPERS[tool]
+    if (takesValue === undefined) return null
+    // Another wrapper (sudo, nice, time, …) in front: skip it and its own flags.
+    i += 1
+    while (argv[i]?.startsWith('-')) i += takesValue.includes(argv[i]!) ? 2 : 1
+  }
+  return null
+}
 
 // Commands that run another, with the flags of theirs that take a value.
 const WRAPPERS: Record<string, string[]> = {
@@ -405,7 +519,7 @@ export function checkOf(words: string[]): Check | null {
   if (r === null) return null
   const scope = r.scope === 'project' && hit.forceScoped === true ? 'scoped' : r.scope
   return {
-    kind: hit.kind, scope, files: [...new Set(r.files)].sort(), label: argv.join(' ').slice(0, 120),
+    kind: hit.kind, scope, files: [...new Set(r.files.map(literal))].sort(), label: literal(argv.join(' ')).slice(0, 120),
     tool: hit.tool, wholeWorkspace: r.whole,
   }
 }
@@ -447,7 +561,7 @@ export type Commit = {
 const EXPANDS = /\$[({A-Za-z_0-9?#@*!$-]|`/
 
 // A `git commit` and where its message comes from; null if the command is not one.
-export function commitOf(words: string[], heredocs: string[]): Commit | null {
+export function commitOf(words: string[], heredocs: string[], liveHeredocs: string[] = []): Commit | null {
   const retargetedByEnv = words.some(w => /^GIT_(DIR|WORK_TREE|INDEX_FILE)=/.test(w))
   const argv = unwrap(stripRedirects(words))
   if (base(argv[0] ?? '') !== 'git') return null
@@ -457,7 +571,7 @@ export function commitOf(words: string[], heredocs: string[]): Commit | null {
   while (i < argv.length && argv[i]!.startsWith('-')) {
     const flag = argv[i]!
     if (flag === '-C') {
-      dirs.push(argv[i + 1] ?? '.')
+      dirs.push(literal(argv[i + 1] ?? '.'))
       i += 2
     } else if (flag === '-c' || flag === '--namespace') {
       i += 2
@@ -474,11 +588,16 @@ export function commitOf(words: string[], heredocs: string[]): Commit | null {
   let amend = false
   let edits: boolean | null = null
   const args = argv.slice(i + 1)
+  // A heredoc whose delimiter was unquoted expands $ in its body.
+  const bodies = () => {
+    if (heredocs.some(b => liveHeredocs.includes(b) && EXPANDS.test(b))) c.unknown = true
+    c.messages.push(...heredocs)
+  }
   const take = (value: string | undefined) => {
     if (value === undefined) return
-    if (/\$\(\s*cat\s*<</.test(value)) c.messages.push(...heredocs)
+    if (/\$\(\s*cat\s*<</.test(value)) bodies()
     else if (EXPANDS.test(value)) c.unknown = true
-    else c.messages.push(value)
+    else c.messages.push(literal(value))
   }
   for (let j = 0; j < args.length; j += 1) {
     const w = args[j]!
@@ -523,9 +642,11 @@ export function commitOf(words: string[], heredocs: string[]): Commit | null {
   }
   if (c.file === '-') {
     c.file = null
-    if (heredocs.length > 0) c.messages.push(...heredocs)
+    if (heredocs.length > 0) bodies()
     else c.unknown = true
   }
+  if (c.file !== null) c.file = literal(c.file)
+  if (c.reuse !== null) c.reuse = literal(c.reuse)
   if (amend && c.messages.length === 0 && c.file === null && c.reuse === null) {
     if (edits === false) c.reuse = 'HEAD'
     else c.unknown = true
@@ -544,12 +665,14 @@ const HEDGE_AFTER = /\b(when|if|unless|until|except|before|previously|earlier|ye
 const PASS = '(?:pass(?:es|ed|ing)?|green|ok|clean)'
 // The pass verb must end the claim: "tests pass", "tests pass now", not "the test passes the token".
 const ENDS = '(?=\\s*(?:$|[.!,;)\\]]|\\s+(?:now|again|locally|on\\s+ci|in\\s+ci|for\\s+me|✅|and|but|with|without|after)\\b))'
+// As ENDS, and an "except …" may follow the all-claim.
+const ENDS_ALL = '(?=\\s*(?:$|[.!,;)\\]]|\\s+(?:now|again|locally|on\\s+ci|in\\s+ci|for\\s+me|✅|and|but|with|without|after|except)\\b))'
 const CLAIM: [ProofKind | 'all', RegExp][] = [
   ['tests', new RegExp(`\\b(?:all\\s+)?(?:unit\\s+|integration\\s+|e2e\\s+)?(?:tests|specs|test suite|test)\\s*:?\\s+(?:(?:are|is|now|all|still)\\s+)*${PASS}${ENDS}`, 'i')],
   ['typecheck', new RegExp(`\\b(?:type-?checks?|typecheck(?:s|ing)?|tsc|type checking|types)\\s*:?\\s+(?:(?:is|are|now|still)\\s+)*${PASS}${ENDS}`, 'i')],
   ['lint', new RegExp(`\\b(?:lint(?:s|ing|er)?|eslint|ruff)\\s*:?\\s+(?:(?:is|are|now|still)\\s+)*${PASS}${ENDS}`, 'i')],
   ['build', new RegExp(`\\bbuilds?\\s*:?\\s+(?:(?:is|are|now|still)\\s+)*(?:${PASS}|succeed(?:s|ed)?)${ENDS}`, 'i')],
-  ['all', /\ball\s+(?:checks?\s+)?(?:are\s+)?(?:green|passing|pass(?:ed)?)\b|\b(?:ci|checks)\s*:?\s+(?:is\s+|are\s+)?(?:green|passing|passed)\b/i],
+  ['all', new RegExp(`\\ball\\s+(?:checks?\\s+)?(?:are\\s+)?(?:green|passing|pass(?:ed)?)${ENDS_ALL}|\\b(?:ci|checks)\\s*:?\\s+(?:is\\s+|are\\s+)?(?:green|passing|passed)${ENDS_ALL}`, 'i')],
 ]
 const KIND_WORDS: [ProofKind, RegExp][] = [
   ['lint', /\blint/i], ['typecheck', /\btype|\btsc/i], ['build', /\bbuild/i], ['tests', /\btest/i],
@@ -566,7 +689,31 @@ export function exceptionsIn(message: string): ProofKind[] {
   return [...new Set(clauses(message).flatMap(clause => claimsOf(clause).except))]
 }
 
-const clauses = (message: string) => message.split(/\n|[.!?;,]\s+|\s+(?:but|while|though)\s+/i)
+// Each claim with the exceptions of its own clause: "all checks pass except lint"
+// trims only that claim, never a separate "lint passes" elsewhere in the message.
+export function claimSets(message: string): Array<{ kind: ProofKind | 'all'; except: ProofKind[] }> {
+  return clauses(message).flatMap(clause => {
+    const { kinds, except } = claimsOf(clause)
+    return kinds.map(kind => ({ kind, except: kind === 'all' ? except : [] }))
+  })
+}
+
+// An "except …" clause stays with the all-claim before it, and only with an all-claim:
+// "All tests pass, except lint" still claims tests.
+const LIST_ITEM = /^\s*(?:and\s+|or\s+)?(?:the\s+)?(?:unit\s+)?(?:tests?|types?|type-?checks?|tsc|lint(?:ing)?|eslint|builds?)\s*$/i
+function clauses(message: string): string[] {
+  const all = CLAIM.find(([k]) => k === 'all')![1]
+  const out: string[] = []
+  for (const piece of message.split(/\n|[.!?;,]\s+|\s+(?:but|while|though)\s+/i)) {
+    const prev = out[out.length - 1]
+    const starts = prev !== undefined && /^\s*except\b/i.test(piece) && all.test(prev)
+    // "except tests, typecheck, and lint": the list after an except stays with it.
+    const continues = prev !== undefined && /\bexcept\b/i.test(prev) && all.test(prev) && LIST_ITEM.test(piece)
+    if (starts || continues) out[out.length - 1] = `${prev}, ${piece}`
+    else out.push(piece)
+  }
+  return out
+}
 
 function claimsOf(clause: string): { kinds: Array<ProofKind | 'all'>; except: ProofKind[] } {
   const kinds: Array<ProofKind | 'all'> = []

@@ -1,7 +1,7 @@
 import { expect, mock, test } from 'claude-code/testing'
 import type { On } from 'claude-code'
 
-import { checkOf, claimsIn, commitOf, exceptionsIn, parse } from '../hooks/shell'
+import { chdirOf, checkOf, claimsIn, commitOf, exceptionsIn, parse } from '../hooks/shell'
 
 const ok = () => ({ result: { stdout: 'ok', stderr: '', interrupted: false } })
 const fail = () => ({ isError: true as const, result: 'exit 1', text: 'exit 1' })
@@ -294,4 +294,159 @@ test('an interrupted rerun casts doubt on the old pass', async ($, on) => {
   await $.tool.call({ tool: 'Bash', command: 'npm test' })
   await $.tool.call({ tool: 'Bash', command: 'npm test' })
   expect(await proofsText($)).toMatch(/did not finish/)
+})
+
+test('a $ inside single quotes or escaped is literal; a live one is not', async () => {
+  const lit = commitOf(parse(`git commit -m 'Fix $PATH handling'`).segments[0]!.words, [])
+  expect(lit?.unknown).toBe(false)
+  expect(lit?.messages).toEqual(['Fix $PATH handling'])
+  expect(commitOf(parse('git commit -m "costs \\$5"').segments[0]!.words, [])?.messages).toEqual(['costs $5'])
+  expect(commitOf(parse('git commit -m "tests $OK"').segments[0]!.words, [])?.unknown).toBe(true)
+  // An unquoted heredoc delimiter expands $ in the body; a quoted one does not.
+  const live = parse(`git commit -m "$(cat <<EOF\ntests $OK\nEOF\n)"`)
+  expect(commitOf(live.segments[0]!.words, live.heredocs, live.liveHeredocs)?.unknown).toBe(true)
+  const quoted = parse(`git commit -m "$(cat <<'EOF'\ncosts $5\nEOF\n)"`)
+  expect(commitOf(quoted.segments[0]!.words, quoted.heredocs, quoted.liveHeredocs)?.unknown).toBe(false)
+})
+
+test('except survives a comma, and all must end its clause', async () => {
+  expect(exceptionsIn('all checks pass, except lint')).toEqual(['lint'])
+  expect(claimsIn('all checks passed review')).toEqual([])
+  expect(claimsIn('All checks pass, except lint')).toEqual(['all'])
+})
+
+test('an exception only trims its own all-claim', async ($, on) => {
+  world(on)
+  on('tool.call', () => ok())
+  await $.tool.call({ tool: 'Bash', command: 'npm test' })
+  await $.tool.call({ tool: 'Bash', command: 'npx tsc --noEmit' })
+  const commit = await $.tool.call({ tool: 'Bash', command: 'git commit -m "All checks pass except lint.\nLint passes."' })
+  expect(commit.deny).toMatch(/claims lint pass/)
+})
+
+test('a commit hidden in a substitution is judged', async ($, on) => {
+  world(on)
+  let commits = 0
+  on('tool.call', (_$, e) => {
+    if (e.tool === 'Bash' && e.command.includes('git commit')) commits += 1
+    return ok()
+  })
+  const commit = await $.tool.call({ tool: 'Bash', command: `echo "$(git commit -m 'All tests pass')"` })
+  expect(commit.deny).toMatch(/Proof Decay/)
+  expect(commits).toBe(0)
+})
+
+test('a run that succeeds next to a substitution or heredoc still records', async ($, on) => {
+  world(on)
+  on('tool.call', () => ok())
+  await $.tool.call({ tool: 'Bash', command: `npm test && git commit -m "$(cat <<'EOF'\nRefactor login\nEOF\n)"` })
+  expect(await proofsText($)).toMatch(/tests fresh/)
+})
+
+test('bash -c runs its chain in its own directory, then the outer one resumes', async ($, on) => {
+  world(on)
+  on('tool.call', () => ok())
+  await $.tool.call({ tool: 'Bash', command: `bash -c 'cd /repo && npm test'` })
+  expect(await proofsText($)).toMatch(/tests fresh/)
+  const commit = await $.tool.call({ tool: 'Bash', command: `bash -c 'cd /other'; git commit -m "All tests pass"` })
+  expect(commit.deny).toBeUndefined()
+})
+
+test('env -C runs a check in another directory', async ($, on) => {
+  world(on)
+  on('tool.call', () => ok())
+  await $.tool.call({ tool: 'Bash', command: 'env -C /other npm test' })
+  const commit = await $.tool.call({ tool: 'Bash', command: 'git commit -m "All tests pass"' })
+  expect(commit.deny).toMatch(/no whole-project tests run/)
+})
+
+test('nested shells: env -C reaches the body, and a parent keeps its own directory', async () => {
+  const p = parse(`env -C /other bash -c 'npm test'`)
+  expect(p.segments.map(s => s.words.join(' '))).toEqual(['npm test'])
+  expect(p.starts).toEqual({ 1: '/other' })
+  const q = parse(`bash -c 'cd /other; bash -c "true"; npm test'`)
+  expect(q.parents).toEqual({ 1: 0, 2: 1 })
+  expect(q.segments.map(s => s.ctx)).toEqual([1, 2, 1])
+})
+
+test('a hidden commit after a cd or an edit in its substitution is refused', async ($, on) => {
+  world(on)
+  on('tool.call', () => ok())
+  await $.tool.call({ tool: 'Bash', command: 'npm test' })
+  const moved = await $.tool.call({ tool: 'Bash', command: `echo "$(cd /other && git commit -am 'Tests pass')"` })
+  expect(moved.deny).toMatch(/Proof Decay/)
+  const edited_ = await $.tool.call({ tool: 'Bash', command: `echo "$(sed -i 's/a/b/' src/a.ts; git commit -am 'Tests pass')"` })
+  expect(edited_.deny).toMatch(/Proof Decay/)
+})
+
+test('a hidden rerun undermines a pass recorded in the same call', async ($, on) => {
+  world(on)
+  on('tool.call', () => ok())
+  await $.tool.call({ tool: 'Bash', command: 'npm test && echo "$(npm test || true)"' })
+  expect(await proofsText($)).toMatch(/could not be attributed/)
+})
+
+test('claim splitting: "except" only trims an all-claim; an all-claim cannot except itself away', async () => {
+  expect(claimsIn('All tests pass, except lint')).toEqual(['tests'])
+  expect(claimsIn('Typecheck is clean, except for the generated file')).toEqual(['typecheck'])
+  expect(exceptionsIn('all checks pass, except lint')).toEqual(['lint'])
+  expect(exceptionsIn('all checks pass except tests, typecheck, and lint').sort()).toEqual(['lint', 'tests', 'typecheck'])
+  expect(claimsIn('All checks pass except lint, tests pass')).toEqual(['all', 'tests'])
+})
+
+test('subshells: ) ends a word, and a cd inside one stays inside', async () => {
+  expect(check('(npm test)')?.kind).toBe('tests')
+  const p = parse('(cd /other ) && git commit -m x')
+  expect(p.segments.map(s => s.words.join(' '))).toEqual(['cd /other', 'git commit -m x'])
+  expect(p.segments[0]!.ctx).not.toBe(p.segments[1]!.ctx)
+})
+
+test('env -C is found behind other wrappers and option values', async () => {
+  expect(chdirOf(parse('env -u PATH -C /other npm test').segments[0]!.words)).toBe('/other')
+  expect(chdirOf(parse('sudo env -C /other npm test').segments[0]!.words)).toBe('/other')
+  expect(chdirOf(parse('nice -n 10 env -C /other npm test').segments[0]!.words)).toBe('/other')
+  expect(chdirOf(parse('npm test').segments[0]!.words)).toBeNull()
+})
+
+test('a heredoc belongs to the command that opened it', async () => {
+  const p = parse(`cat <<EOF\nAll tests pass\nEOF\ngit commit -m "$(cat <<'EOF'\nrefactor\nEOF\n)"`)
+  const seg = p.segments.find(s => s.words[0] === 'git')!
+  const docs = seg.docs.map(d => p.heredocs[d]!)
+  expect(commitOf(seg.words, docs, docs.filter(d => p.liveHeredocs.includes(d)))?.messages).toEqual(['refactor'])
+})
+
+test('a subshell cd does not move the commit', async ($, on) => {
+  world(on)
+  on('tool.call', () => ok())
+  const commit = await $.tool.call({ tool: 'Bash', command: '(cd /other ) && git commit -m "All tests pass"' })
+  expect(commit.deny).toMatch(/\/repo|no whole-project tests run/)
+})
+
+test('a group inside bash -c does not blank the outer chain', async ($, on) => {
+  world(on)
+  on('tool.call', () => ok())
+  await $.tool.call({ tool: 'Bash', command: `npm test && bash -c '(true)'` })
+  expect(await proofsText($)).toMatch(/tests fresh/)
+})
+
+test('a hidden rerun inside a bash -c body undermines the pass', async ($, on) => {
+  world(on)
+  on('tool.call', () => ok())
+  await $.tool.call({ tool: 'Bash', command: 'npm test' })
+  await $.tool.call({ tool: 'Bash', command: `bash -c 'echo $(npm test || true)'` })
+  expect(await proofsText($)).toMatch(/could not be attributed/)
+})
+
+test('a literal, claim-free commit in a substitution is allowed', async ($, on) => {
+  world(on)
+  on('tool.call', () => ok())
+  const commit = await $.tool.call({ tool: 'Bash', command: `echo "$(git commit -m 'wip')"` })
+  expect(commit.deny).toBeUndefined()
+})
+
+test('an all-claim that excepts every check is refused', async ($, on) => {
+  world(on)
+  on('tool.call', () => ok())
+  const commit = await $.tool.call({ tool: 'Bash', command: 'git commit -m "all checks pass except tests, typecheck, and lint"' })
+  expect(commit.deny).toMatch(/excepting every one/)
 })

@@ -2,8 +2,8 @@ import { atom, read, update } from 'claude-code'
 import type { EngineInterface, Register } from 'claude-code'
 
 import type { Proof, ProofKind } from '../types'
-import { checkOf, claimsIn, commitOf, exceptionsIn, isHarmless, isInfallible, parse, resolvePath, substitutions, unwrap } from './shell'
-import type { Check, Commit } from './shell'
+import { chdirOf, checkOf, claimSets, claimsIn, commitOf, isHarmless, isInfallible, literal, parse, resolvePath, substitutions, unwrap } from './shell'
+import type { Check, Commit, Parsed } from './shell'
 
 const proofs = atom({ plugin: 'proof-decay', key: 'proofs' } as const, {})
 const edits = atom({ plugin: 'proof-decay', key: 'edits' } as const, 0)
@@ -18,14 +18,23 @@ const AMBIGUOUS = 'a later run of it had an outcome that could not be attributed
 // The working tree as git sees it: every tracked or untracked, non-ignored file
 // that exists, by path and content id. HEAD and the index are left out, so
 // committing the tested tree leaves it unchanged. Filters never run (--no-filters).
+// A submodule counts by its HEAD plus its own dirty work tree (tracked changes
+// and untracked files by content), so an edit inside it makes proofs stale.
 const FINGERPRINT = `set -eo pipefail
 files=$(mktemp); out=$(mktemp)
 trap 'rm -f "$files" "$out"' EXIT
+sub_state() {
+  { git -C "$1" diff HEAD --no-ext-diff --no-textconv --binary -- 2>/dev/null || echo unreadable
+    git -C "$1" -c core.quotePath=false ls-files -z -o --exclude-standard 2>/dev/null | while IFS= read -r -d '' u; do
+      printf 'new %s %s\\0' "$u" "$(git -C "$1" hash-object --no-filters -- "$u" 2>/dev/null || echo unreadable)"
+    done
+  } | git hash-object --stdin
+}
 git -c core.quotePath=false ls-files -z -co --exclude-standard --deduplicate | while IFS= read -r -d '' f; do
-  if [ -L "$f" ]; then printf 'link %s -> %s\\n' "$f" "$(readlink "$f")" >> "$out"
-  elif [ -d "$f" ]; then printf 'sub %s %s\\n' "$f" "$(git -C "$f" rev-parse HEAD 2>/dev/null || echo none)" >> "$out"
+  if [ -L "$f" ]; then printf 'link %s -> %s\\n' "$f" "$(readlink -- "$f")" >> "$out"
+  elif [ -d "$f" ]; then printf 'sub %s %s %s\\n' "$f" "$(git -C "$f" rev-parse HEAD 2>/dev/null || echo none)" "$(sub_state "$f")" >> "$out"
   elif [ -f "$f" ]; then
-    case "$f" in *$'\\n'*) printf 'odd %s %s\\n' "$f" "$(wc -c < "$f")" >> "$out" ;; *) printf '%s\\n' "$f" >> "$files" ;; esac
+    case "$f" in *$'\\n'*) printf 'odd %s %s\\n' "$f" "$(git hash-object --no-filters -- "$f")" >> "$out" ;; *) printf '%s\\n' "$f" >> "$files" ;; esac
     if [ -x "$f" ]; then printf 'exec %s\\n' "$f" >> "$out"; fi
   fi
 done
@@ -160,7 +169,7 @@ type BashResult = {
 }
 
 // dir is null after a directory change this mod cannot follow (popd, cd ~, cd -, cd $X).
-type Step = { words: string[]; sep: string; dir: string | null; check: Check | null; commit: Commit | null }
+type Step = { words: string[]; sep: string; ctx: number; docs: number[]; dir: string | null; check: Check | null; commit: Commit | null }
 
 // Whether the commands before a commit stage the whole tree. Only a full-repo
 // add counts (-A / --all / :/ with no pathspec, or `.` from the repo root); any
@@ -186,6 +195,69 @@ function stagedBefore(steps: Step[], upTo: number, root: string): boolean {
     if (full || (paths.length === 1 && (paths[0] === ':/' || (paths[0] === '.' && dir === root)))) all = true
   }
   return all
+}
+
+// Each simple command with the directory it runs in. Every shell has its own
+// directory: a `bash -c` body starts where its parent shell is, its cd ends with
+// it, and the parent carries on from its own directory. `env -C dir cmd` runs cmd
+// elsewhere without moving the shell.
+function stepsOf(parsed: Parsed, cwd: string | null): Step[] {
+  const dirs = new Map<number, string | null>([[0, cwd]])
+  const dirOf = (ctx: number): string | null => {
+    if (!dirs.has(ctx)) {
+      const from = dirOf(parsed.parents[ctx] ?? 0)
+      const start = parsed.starts[ctx]
+      dirs.set(ctx, start === undefined ? from : /^[~$+-]/.test(start) || from === null ? null : resolvePath(from, literal(start)))
+    }
+    return dirs.get(ctx) ?? null
+  }
+  return parsed.segments.map(seg => {
+    const dir = dirOf(seg.ctx)
+    const argv = unwrap(seg.words)
+    const moved = chdirOf(seg.words)
+    const runsIn = moved === null ? dir : /^[~$+-]/.test(moved) || dir === null ? null : resolvePath(dir, literal(moved))
+    const docs = seg.docs.map(d => parsed.heredocs[d]!).filter(d => d !== undefined)
+    const live = docs.filter(d => parsed.liveHeredocs.includes(d))
+    const step: Step = { ...seg, dir: runsIn, check: checkOf(seg.words), commit: commitOf(seg.words, docs, live) }
+    if (argv[0] === 'cd' || argv[0] === 'pushd') {
+      const to = argv[1]
+      dirs.set(seg.ctx, to === undefined || /^[~$+-]/.test(to) || dir === null ? null : resolvePath(dir, literal(to)))
+    } else if (argv[0] === 'popd') dirs.set(seg.ctx, null)
+    return step
+  })
+}
+
+type HiddenRun = { steps: Step[]; before: Step[] }
+
+// The commands inside $(...) and backticks. The call's own substitutions start in
+// the directory of the command that holds them, after the steps before it; each
+// nested shell body's start where that body runs. Bodies are new shells: the outer
+// quoting that hid their substitutions from the call does not hide them from it.
+function hiddenRuns(parsed: Parsed, steps: Step[], command: string, cwd: string): HiddenRun[] {
+  const out: HiddenRun[] = []
+  if (!parsed.complex) return out
+  const sources: { text: string; ctx: number | null }[] = [{ text: command, ctx: null }, ...parsed.bodies]
+  const seen = new Set<string>()
+  for (const src of sources) {
+    for (const sub of substitutions(src.text)) {
+      const key = `${src.ctx}|${sub}`
+      if (seen.has(key)) continue
+      seen.add(key)
+      const at = steps.findIndex(st => (src.ctx === null || st.ctx === src.ctx) && st.words.some(w => w.includes(sub)))
+      const host = at === -1 ? undefined : steps[at]
+      const start = host !== undefined ? host.dir : src.ctx === null ? cwd : steps.find(st => st.ctx === src.ctx)?.dir ?? null
+      const before = at === -1 ? [...steps] : steps.slice(0, at)
+      out.push({ steps: stepsOf(parse(sub), start), before })
+    }
+  }
+  return out
+}
+
+// The repo each run belongs to; null when its directory could not be followed.
+async function rootsFor($: EngineInterface, runs: { check: Check; dir: string | null }[]): Promise<{ root: string | null; kind: ProofKind }[]> {
+  const out: { root: string | null; kind: ProofKind }[] = []
+  for (const r of runs) out.push({ root: r.dir === null ? null : (await rootOf($, r.dir)).root, kind: r.check.kind })
+  return out
 }
 
 const base = (word: string) => word.replace(/^.*\//, '')
@@ -235,13 +307,18 @@ async function judgeCommit($: EngineInterface, steps: Step[], at: number): Promi
   const mine = Object.values(await read($, proofs)).filter(p => p.root === root)
 
   const kinds = new Set<ProofKind>()
-  for (const claim of claims) {
-    if (claim === 'all') {
-      for (const k of ['tests', 'typecheck', 'lint'] as const) kinds.add(k)
-      if (mine.some(p => p.kind === 'build' && p.scope === 'project')) kinds.add('build')
-    } else kinds.add(claim)
+  for (const claim of claimSets(text)) {
+    if (claim.kind === 'all') {
+      // An exception trims only the all-claim of its own clause.
+      const all: ProofKind[] = ['tests', 'typecheck', 'lint']
+      if (mine.some(p => p.kind === 'build' && p.scope === 'project')) all.push('build')
+      const left = all.filter(k => !claim.except.includes(k))
+      if (left.length === 0) {
+        return 'Proof Decay: the commit message says all checks pass while excepting every one of them, so nothing it claims can be verified. Say which checks passed, or take the claim out.'
+      }
+      for (const k of left) kinds.add(k)
+    } else kinds.add(claim.kind)
   }
-  for (const k of exceptionsIn(text)) kinds.delete(k)
   if (unknown) {
     // A message nobody can read may claim anything: every check must hold, tests at least.
     kinds.add('tests')
@@ -342,18 +419,9 @@ export const register: Register = on => {
     const parsed = parse(e.command)
     const cwd = await $.session.cwd()
 
-    // Each simple command with the directory it runs in.
-    let dir: string | null = cwd
-    const steps: Step[] = parsed.segments.map(seg => {
-      const argv = unwrap(seg.words)
-      const step = { ...seg, dir, check: checkOf(seg.words), commit: commitOf(seg.words, parsed.heredocs) }
-      if (argv[0] === 'cd' || argv[0] === 'pushd') {
-        const to = argv[1]
-        if (to === undefined || /^[~$+-]/.test(to)) dir = null
-        else if (dir !== null) dir = resolvePath(dir, to)
-      } else if (argv[0] === 'popd') dir = null
-      return step
-    })
+    // Each simple command with the directory it runs in. A `bash -c` body starts
+    // where the call's shell is, and its cd ends with it.
+    const steps = stepsOf(parsed, cwd)
 
     for (let i = 0; i < steps.length; i += 1) {
       if (steps[i]!.commit === null) continue
@@ -361,11 +429,23 @@ export const register: Register = on => {
       if (reason !== null) return { deny: reason }
     }
 
+    // What runs inside $(...) and backticks, in the call and in each nested shell body,
+    // with the directory it starts from and the steps of the call already run by then.
+    const subs = hiddenRuns(parsed, steps, e.command, cwd)
+
+    // A commit inside a substitution runs too: judge it after its own body's earlier
+    // steps and the call's steps before the command that holds it.
+    for (const sub of subs) {
+      for (let i = 0; i < sub.steps.length; i += 1) {
+        if (sub.steps[i]!.commit === null) continue
+        const around = [...sub.before, ...sub.steps.slice(0, i + 1)]
+        const reason = await judgeCommit($, around, around.length - 1)
+        if (reason !== null) return { deny: reason }
+      }
+    }
     const checks = steps.filter((s): s is Step & { dir: string; check: Check } => s.check !== null && s.dir !== null)
     // Checks hidden in $(...) or backticks run too, with outcomes nobody sees.
-    const hidden = parsed.complex
-      ? substitutions(e.command).flatMap(sub => parse(sub).segments.map(seg => checkOf(seg.words))).filter((c): c is Check => c !== null)
-      : []
+    const hidden = subs.flatMap(sub => sub.steps.filter(st => st.check !== null).map(st => ({ check: st.check!, dir: st.dir })))
     const before = new Map<string, string | null>()
     const editsBefore = await read($, edits)
     for (const s of checks) {
@@ -388,16 +468,21 @@ export const register: Register = on => {
     const unfinished = e.run_in_background === true || result.backgroundTaskId !== undefined || result.interrupted === true
     // A check in a directory this mod lost track of, or one that never finished,
     // says nothing new: it only casts doubt on the earlier pass of its kind.
-    const lost = steps.filter(s => s.check !== null && s.dir === null).map(s => s.check!)
-    const doubtful = unfinished ? [...checks.map(s => s.check), ...hidden, ...lost] : lost
+    const lost = steps.filter(s => s.check !== null && s.dir === null).map(s => ({ check: s.check!, dir: null }))
+    const doubtful: { check: Check; dir: string | null }[] = unfinished
+      ? [...checks.map(s => ({ check: s.check, dir: s.dir as string | null })), ...hidden, ...lost]
+      : lost
     if (doubtful.length > 0) {
-      const root = (await rootOf($, cwd)).root
+      const marks = await rootsFor($, doubtful)
       await update($, proofs, all => {
         const out: Record<string, Proof> = { ...all }
-        for (const c of doubtful) {
-          const key = `${root}|${c.kind}|project`
-          const p = out[key]
-          if (p !== undefined && p.status === 'pass') out[key] = { ...p, doubt: unfinished ? 'a later run of it did not finish' : AMBIGUOUS }
+        for (const m of marks) {
+          for (const key of Object.keys(out)) {
+            const p = out[key]!
+            if (p.kind !== m.kind || p.scope !== 'project' || p.status !== 'pass') continue
+            if (m.root !== null && p.root !== m.root) continue
+            out[key] = { ...p, doubt: unfinished ? 'a later run of it did not finish' : AMBIGUOUS }
+          }
         }
         return out
       })
@@ -406,11 +491,15 @@ export const register: Register = on => {
       const now = await $.clock.now()
       const editedMeanwhile = (await read($, edits)) !== editsBefore + (written.length > 0 ? 1 : 0)
       const recorded: Record<string, Proof> = {}
-      const undermined: { root: string; kind: ProofKind; why: string }[] = []
+      // root null: a directory nobody could follow, so every repo's pass of that kind is in doubt.
+      const undermined: { root: string | null; kind: ProofKind; why: string; over?: boolean }[] = []
       const seps = steps.map(s => s.sep)
-      const andChain = !parsed.complex && seps.every(sep => sep === '' || sep === '&&')
+      // Substitutions and heredocs inside words do not change whose exit status the call has; grouping does.
+      const andChain = !parsed.grouped && seps.every(sep => sep === '' || sep === '&&')
 
-      for (const c of hidden) undermined.push({ root: (await rootOf($, cwd)).root, kind: c.kind, why: AMBIGUOUS })
+      // A check in a substitution may run before or after the visible one: its doubt
+      // stands even over a pass recorded in this same call.
+      for (const m of await rootsFor($, hidden)) undermined.push({ root: m.root, kind: m.kind, why: AMBIGUOUS, over: true })
 
       for (const s of checks) {
         const index = steps.indexOf(s)
@@ -418,7 +507,7 @@ export const register: Register = on => {
         const before_ = seps.slice(0, index)
         // When this check's own outcome can be read from the one exit status the call has.
         let outcome: 'pass' | 'fail' | null = null
-        if (!parsed.complex && s.sep !== '&' && s.sep !== '|') {
+        if (!parsed.grouped && s.sep !== '&' && s.sep !== '|') {
           if (andChain && !failed) outcome = 'pass'
           else if (andChain && failed && checks.length === 1 && steps.every(o => o === s || isInfallible(o.words))) outcome = 'fail'
           else if (isLast && before_.every(sep => sep === ';' || sep === '&&') && !failed) outcome = 'pass'
@@ -449,9 +538,13 @@ export const register: Register = on => {
       await update($, proofs, all => {
         const out: Record<string, Proof> = { ...all, ...recorded }
         for (const u of undermined) {
-          const key = `${u.root}|${u.kind}|project`
-          const p = out[key]
-          if (p !== undefined && recorded[key] === undefined && p.status === 'pass') out[key] = { ...p, doubt: u.why }
+          for (const key of Object.keys(out)) {
+            const p = out[key]!
+            if (p.kind !== u.kind || p.scope !== 'project' || p.status !== 'pass') continue
+            if (u.root !== null && p.root !== u.root) continue
+            if (recorded[key] !== undefined && u.over !== true) continue
+            out[key] = { ...p, doubt: u.why }
+          }
         }
         return out
       })
