@@ -2,7 +2,7 @@
 
 ![Proof Decay demo](media/demo.gif)
 
-*Tests and tsc pass, so the board reads `✓ tests fresh · ✓ types fresh`. One edit later both go `⚠ stale (1 edit)`, and a commit claiming "All tests pass" is refused by Oathkeeper. [MP4](media/demo.mp4)*
+*Tests and tsc pass, so the board reads `✓ tests fresh · ✓ types fresh`. One edit later both go `⚠ stale (1 edit)`, and a commit claiming "All tests pass" is refused by Oathkeeper. [MP4](https://github.com/ccdwyer/claude-mods/raw/main/media/proof-decay.mp4)*
 
 | Fresh | Stale | Refused |
 |---|---|---|
@@ -35,3 +35,22 @@ Recognised commands include `npm`/`yarn`/`pnpm`/`bun` `test`/`lint`/`typecheck`/
 claude plugin validate .
 claude plugin test .
 ```
+
+## What it hooks
+
+Events this mod hooks, as `claude plugin validate` reads the module:
+
+- `session.start`
+- `command.run{command=proofs}`
+- `tool.call{tool=Bash}`
+- `tool.call`
+- `turn.complete`
+- `ui.render{component=AbovePrompt}`
+
+Engine calls it makes: `$.clock.now`, `$.command.register`, `$.fs.read (via demote`, `judgeCommit)`, `$.fs.stat (via exists)`, `$.process.run (via fingerprint`, `judgeCommit`, `rootOf)`, `$.session.cwd`, `$.state.get`, `$.state.set`, `$.ui.resolve`.
+
+A `tool.call` hook sits in the middle of every tool call: it can see the call, refuse it, or add context to its result. This mod uses that only for the behaviour described above.
+
+## License
+
+MIT
